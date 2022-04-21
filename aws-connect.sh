@@ -2,14 +2,65 @@
 
 set -e
 
-# replace with your hostname
-VPN_HOST="cvpn-endpoint-<id>.prod.clientvpn.us-east-1.amazonaws.com"
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <OpenVPN Config File>"
+  exit 1
+fi
+
+OPENVPN_CONFIG=$1
+
+# Read proto, host, and port from the AWS-provided VPN config.
+while read key value; do
+  case ${key} in
+  proto)
+    PROTO=${value}
+    ;;
+  remote)
+    # shellcheck disable=SC2206
+    args=(${value})
+    VPN_HOST=${args[0]}
+    PORT=${args[1]}
+    ;;
+
+  esac
+done <"${OPENVPN_CONFIG}"
+
+echo "Connecting to host:${VPN_HOST} port:${PORT} proto:${PROTO}"
+
 # path to the patched openvpn
 OVPN_BIN="./openvpn"
 # path to the configuration file
-OVPN_CONF="vpn.conf"
-PORT=1194
-PROTO=udp
+MODIFIED_CONFIG=$(mktemp)
+trap 'rm -f ${MODIFIED_CONFIG}' EXIT
+cp "${OPENVPN_CONFIG}" "${MODIFIED_CONFIG}"
+sed -ri "/^auth-(federate|retry)/d" "${MODIFIED_CONFIG}"
+
+# Sometimes AWS generates a file without an LF
+echo >> "${MODIFIED_CONFIG}"
+
+# Handle custom domain mappings since AWS can't.
+if [ -f domains.txt ]; then
+  CONFIG_NAME=${OPENVPN_CONFIG%.*}
+  echo "CONFIG_NAME=$CONFIG_NAME"
+  while read domain_name; do
+    echo "Configuring DNS for domain ${domain_name}"
+    echo "dhcp-option domain ${domain_name}" >>"${MODIFIED_CONFIG}"
+  done <domains.txt
+fi
+
+# Support https://github.com/jonathanio/update-systemd-resolved/ to configure systemd-resolved DNS resolution
+DNS_COMMAND="$(command -v update-systemd-resolved)"
+if [ -x "${DNS_COMMAND}" ]; then
+  {
+    echo "setenv PATH /usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    echo "up ${DNS_COMMAND}"
+    echo "up-restart"
+    echo "down ${DNS_COMMAND}"
+    echo "down-pre"
+  } >>"${MODIFIED_CONFIG}"
+else
+  echo "Consider installing https://github.com/jonathanio/update-systemd-resolved/ if you use systemd-resolved."
+fi
 
 wait_file() {
   local file="$1"; shift
@@ -28,14 +79,24 @@ SRV=$(dig a +short "${RAND}.${VPN_HOST}"|head -n1)
 rm -f saml-response.txt
 
 echo "Getting SAML redirect URL from the AUTH_FAILED response (host: ${SRV}:${PORT})"
-OVPN_OUT=$($OVPN_BIN --config "${OVPN_CONF}" --verb 3 \
-     --proto "$PROTO" --remote "${SRV}" "${PORT}" \
-     --auth-user-pass <( printf "%s\n%s\n" "N/A" "ACS::35001" ) \
-    2>&1 | grep AUTH_FAILED,CRV1)
+OVPN_OUT=$($OVPN_BIN --config "${MODIFIED_CONFIG}" --verb 3 \
+  --connect-retry-max 3 \
+  --connect-timeout 5 \
+  --proto "${PROTO}" \
+  --remote "${SRV}" "${PORT}" \
+  --auth-user-pass fakecreds.txt \
+  2>&1 | grep AUTH_FAILED,CRV1)
+
+SERVER_PID=$(pgrep -f "go run server.go" || true)
+if [ "${SERVER_PID}" == "" ]; then
+  go run server.go &
+  SERVER_PID=$!
+fi
+trap 'pkill -P ${SERVER_PID}' EXIT
 
 echo "Opening browser and wait for the response file..."
-URL=$(echo "$OVPN_OUT" | grep -Eo 'https://.+')
-
+URL=$(echo "${OVPN_OUT}" | grep -Eo 'https://.+')
+trap 'rm -f saml-response.txt' EXIT
 unameOut="$(uname -s)"
 case "${unameOut}" in
     Linux*)     xdg-open "$URL";;
@@ -47,17 +108,22 @@ wait_file "saml-response.txt" 30 || {
   echo "SAML Authentication time out"
   exit 1
 }
+pkill -P ${SERVER_PID}
 
 # get SID from the reply
-VPN_SID=$(echo "$OVPN_OUT" | awk -F : '{print $7}')
+VPN_SID=$(echo "${OVPN_OUT}" | awk -F : '{print $7}')
+
+printf '%s\n%s\n' "N/A" "CRV1::${VPN_SID}::$(cat saml-response.txt)" >"${SAML_CREDS:=$(mktemp)}"
+trap 'rm -f ${SAML_CREDS}' EXIT
+rm -f saml-response.txt
 
 echo "Running OpenVPN with sudo. Enter password if requested"
 
 # Finally OpenVPN with a SAML response we got
 # Delete saml-response.txt after connect
-sudo bash -c "$OVPN_BIN --config "${OVPN_CONF}" \
+sudo bash -c "$OVPN_BIN --config ${MODIFIED_CONFIG} \
     --verb 3 --auth-nocache --inactive 3600 \
-    --proto "$PROTO" --remote $SRV $PORT \
+    --proto $PROTO --remote $SRV $PORT \
     --script-security 2 \
-    --route-up '/usr/bin/env rm saml-response.txt' \
-    --auth-user-pass <( printf \"%s\n%s\n\" \"N/A\" \"CRV1::${VPN_SID}::$(cat saml-response.txt)\" )"
+    --route-up '/usr/bin/env rm ${SAML_CREDS}' \
+    --auth-user-pass ${SAML_CREDS}"
